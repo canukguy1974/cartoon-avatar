@@ -21,9 +21,8 @@
     .avatar-wrap {
       width: 320px;
       height: 320px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      display: grid;
+      place-items: center;
       background: white;
       border-radius: 20px;
       box-shadow: 0 8px 30px rgba(0,0,0,0.08);
@@ -31,10 +30,25 @@
       overflow: hidden;
     }
 
-    #mouthFrame {
+    .avatar-stage {
+      position: relative;
       width: 260px;
-      height: auto;
+      height: 260px;
+    }
+
+    .avatar-stage img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
       object-fit: contain;
+      display: block;
+    }
+
+    #mouthOverlay {
+      transition: opacity 80ms ease;
+      will-change: opacity;
+      opacity: 1;
     }
 
     button {
@@ -67,40 +81,71 @@
   <h1>Sunny Mouth Test</h1>
 
   <div class="avatar-wrap">
-    <img id="mouthFrame" src="./mouths/X.png" alt="Sunny mouth frame" />
+    <div class="avatar-stage">
+      <img id="baseHead" src="./mouths/base-head.png" alt="Sunny base head" />
+      <img id="mouthOverlay" src="./mouths/X.png" alt="Sunny mouth overlay" />
+    </div>
   </div>
   <input id="inputText" placeholder="Say something..." />
-  <button id="playBtn">Play Test</button>
+  <button id="playBtn" disabled>Loading Mouths...</button>
 
   <audio id="audio" src="http://localhost:8000/static/audio/test.wav"></audio>
 
   <pre id="debug"></pre>
 
 <script>
-const mouthFrame = document.getElementById("mouthFrame");
+const baseHead = document.getElementById("baseHead");
+const mouthOverlay = document.getElementById("mouthOverlay");
 const playBtn = document.getElementById("playBtn");
 const audio = document.getElementById("audio");
 const debug = document.getElementById("debug");
 const input = document.getElementById("inputText");
 
-const fallbackMap = {
-  X: "X",
-  A: "A",
-  B: "B",
-  C: "C",
-  D: "C",
-  E: "E",
-  F: "F",
-  G: "F",
-  H: "A"
+const visemeMap = {
+  X: "./mouths/X.png",
+  A: "./mouths/X.png",
+  B: "./mouths/B.png",
+  C: "./mouths/C.png",
+  D: "./mouths/D.png",
+  E: "./mouths/E.png",
+  F: "./mouths/F.png",
+  G: "./mouths/G.png",
+  H: "./mouths/H.png"
 };
+
+const preloadSources = [...new Set(["./mouths/base-head.png", ...Object.values(visemeMap)])];
 
 let mouthCues = [];
 let rafId = null;
+let currentMouthSource = visemeMap.X;
+
+function preloadImages() {
+  return Promise.all(
+    preloadSources.map(
+      source =>
+        new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(source);
+          image.onerror = () => reject(new Error(`Failed to preload ${source}`));
+          image.src = source;
+        })
+    )
+  );
+}
 
 function setMouth(viseme) {
-  const mapped = fallbackMap[viseme] || "X";
-  mouthFrame.src = `./mouths/${mapped}.png`;
+  const nextSource = visemeMap[viseme] || visemeMap.X;
+  if (nextSource === currentMouthSource) {
+    return;
+  }
+
+  currentMouthSource = nextSource;
+  mouthOverlay.style.opacity = "0.86";
+  mouthOverlay.src = nextSource;
+
+  requestAnimationFrame(() => {
+    mouthOverlay.style.opacity = "1";
+  });
 }
 
 function animateMouths() {
@@ -159,9 +204,25 @@ async function playTest() {
   }
 }
 
+async function initializeAvatar() {
+  try {
+    await preloadImages();
+    baseHead.src = "./mouths/base-head.png";
+    mouthOverlay.src = visemeMap.X;
+    currentMouthSource = visemeMap.X;
+    playBtn.disabled = false;
+    playBtn.textContent = "Play Test";
+  } catch (err) {
+    console.error(err);
+    debug.textContent = String(err);
+    playBtn.textContent = "Asset Load Failed";
+  }
+}
+
 audio.addEventListener("ended", () => {
   setMouth("X");
 });
 
 playBtn.addEventListener("click", playTest);
+initializeAvatar();
 </script>
