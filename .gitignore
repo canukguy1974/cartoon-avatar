@@ -1,0 +1,25 @@
+.codex
+
+# Python environments and caches
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Local environment files
+.env
+.env.*
+
+# Generated backend artifacts
+backend/temp/
+backend/static/audio/speech-*.mp3
+backend/static/audio/speech-*.wav
+backend/static/audio/*.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*Zone.Identifier
