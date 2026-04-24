@@ -1,14 +1,26 @@
+import base64
+import json
+import logging
+import re
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.services.llm_service import stream_chat_response
 from app.services.rhubarb_service import TEST_WAV, run_rhubarb
+from app.services.sentence_service import split_sentences
+from app.services.streaming_tts_service import generate_sentence_audio
 from app.services.tts_service import generate_speech_audio
 
+# Load .env from the backend directory with override so changes stick on reload.
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(BACKEND_DIR / ".env", override=True)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Sunny Local Backend")
 
@@ -21,6 +33,10 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=BACKEND_DIR / "static"), name="static")
+
+# ── Sentence boundary pattern for incremental streaming ──
+_SENTENCE_END = re.compile(r'[.!?…]\s*$')
+
 
 @app.get("/health")
 def health():
@@ -51,3 +67,137 @@ async def avatar_speak(req: Request):
         "audioUrl": audio_info["audio_url"],
         "mouthCues": rhubarb_data.get("mouthCues", []),
     }
+
+
+@app.websocket("/api/avatar/stream")
+async def avatar_stream(ws: WebSocket):
+    """Stream LLM → sentence split → TTS → visemes over WebSocket.
+
+    Client sends: ``{"text": "user question"}``
+    Server sends back a sequence of JSON messages:
+      1. ``{"type": "thinking"}`` — immediately
+      2. ``{"type": "text_delta", "token": "..."}`` — LLM tokens as they arrive
+      3. ``{"type": "audio_chunk", "audio": "<base64>", "mouthCues": [...], ...}``
+      4. ``{"type": "done"}`` — after last chunk
+    """
+    await ws.accept()
+
+    try:
+        raw = await ws.receive_text()
+        payload = json.loads(raw)
+        user_text = (payload.get("text") or "").strip() or "hello there"
+
+        # Immediately tell the client we're thinking.
+        await ws.send_json({"type": "thinking"})
+
+        # ── Stream LLM response, accumulate into sentences ──
+        buffer = ""
+        chunk_index = 0
+        full_response = ""
+
+        async for token in stream_chat_response(user_text):
+            full_response += token
+            buffer += token
+
+            # Send each token to the frontend for live text display.
+            await ws.send_json({"type": "text_delta", "token": token})
+
+            # Use the robust split_sentences to check if we have complete sentences
+            sentences = split_sentences(buffer)
+            
+            # If we have more than 1 sentence, the first ones are definitely complete.
+            # We keep the last one in the buffer as it might still be generating.
+            if len(sentences) > 1:
+                complete_sentences = sentences[:-1]
+                buffer = sentences[-1] # keep the trailing incomplete sentence
+
+                for sentence in complete_sentences:
+                    if not sentence.strip():
+                        continue
+
+                    # Generate TTS + visemes for this sentence.
+                    try:
+                        audio_result = await generate_sentence_audio(sentence)
+                        wav_bytes = audio_result["wav_bytes"]
+                        duration = audio_result["duration_seconds"]
+
+                        # Run Rhubarb for viseme cues.
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            tmp.write(wav_bytes)
+                            tmp_path = tmp.name
+
+                        try:
+                            rhubarb_data = run_rhubarb(tmp_path)
+                            mouth_cues = rhubarb_data.get("mouthCues", [])
+                        except Exception as rhubarb_err:
+                            logger.warning("Rhubarb failed for chunk %d: %s", chunk_index, rhubarb_err)
+                            mouth_cues = []
+                        finally:
+                            Path(tmp_path).unlink(missing_ok=True)
+
+                        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+
+                        await ws.send_json({
+                            "type": "audio_chunk",
+                            "audio": audio_b64,
+                            "mouthCues": mouth_cues,
+                            "chunkIndex": chunk_index,
+                            "duration": duration,
+                            "sentence": sentence,
+                        })
+                        chunk_index += 1
+
+                    except Exception as chunk_err:
+                        logger.error("Failed to generate chunk %d: %s", chunk_index, chunk_err)
+                        await ws.send_json({
+                            "type": "error",
+                            "message": f"Chunk {chunk_index} failed: {chunk_err}",
+                            "chunkIndex": chunk_index,
+                        })
+
+        # ── Flush any remaining text in the buffer ──
+        remaining = buffer.strip()
+        if remaining:
+            try:
+                audio_result = await generate_sentence_audio(remaining)
+                wav_bytes = audio_result["wav_bytes"]
+                duration = audio_result["duration_seconds"]
+
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(wav_bytes)
+                    tmp_path = tmp.name
+
+                try:
+                    rhubarb_data = run_rhubarb(tmp_path)
+                    mouth_cues = rhubarb_data.get("mouthCues", [])
+                except Exception as rhubarb_err:
+                    logger.warning("Rhubarb flush failed: %s", rhubarb_err)
+                    mouth_cues = []
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+
+                audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+
+                await ws.send_json({
+                    "type": "audio_chunk",
+                    "audio": audio_b64,
+                    "mouthCues": mouth_cues,
+                    "chunkIndex": chunk_index,
+                    "duration": duration,
+                    "sentence": remaining,
+                })
+            except Exception as flush_err:
+                logger.error("Flush chunk failed: %s", flush_err)
+
+        await ws.send_json({"type": "done", "fullResponse": full_response})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    except Exception as e:
+        logger.error("WebSocket error: %s", e)
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass

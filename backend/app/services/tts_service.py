@@ -13,6 +13,19 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 AUDIO_DIR = BACKEND_DIR / "static" / "audio"
 DEFAULT_TEXT = "hello there"
 DEFAULT_VOICE = "en-US-AvaNeural"
+MAX_GENERATED_AUDIO_FILES = 20
+
+
+def prune_generated_audio_files(audio_dir: Path, keep: int = MAX_GENERATED_AUDIO_FILES) -> None:
+    generated_files = [
+        path
+        for path in audio_dir.glob("speech-*")
+        if path.is_file() and path.suffix in {".mp3", ".wav"}
+    ]
+    generated_files.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+
+    for old_path in generated_files[keep:]:
+        old_path.unlink(missing_ok=True)
 
 
 async def generate_speech_audio(text: str, audio_dir: Path | None = None) -> dict:
@@ -29,6 +42,7 @@ async def generate_speech_audio(text: str, audio_dir: Path | None = None) -> dic
 
     communicator = edge_tts.Communicate(normalized_text, voice=DEFAULT_VOICE)
 
+    generated_successfully = False
     try:
         await communicator.save(str(mp3_path))
 
@@ -54,9 +68,12 @@ async def generate_speech_audio(text: str, audio_dir: Path | None = None) -> dic
             error_text = stderr.decode().strip() or "ffmpeg conversion failed"
             raise RuntimeError(error_text)
 
+        generated_successfully = True
         return {
             "audio_path": wav_path,
             "audio_url": f"/static/audio/{wav_path.name}",
         }
     finally:
         mp3_path.unlink(missing_ok=True)
+        if generated_successfully:
+            prune_generated_audio_files(target_dir)
