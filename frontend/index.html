@@ -355,6 +355,7 @@ const preloadSources = [...new Set(["./mouths/base-head.png", ...Object.values(v
 let currentMouthSource = visemeMap.X;
 let appState = "idle";           // idle | thinking | speaking
 let audioCtx = null;
+let fillerData = [];             // Stores our pre-computed filler payload
 
 // ═══════════════════════════════════════════════════════════
 //  IDLE ANIMATION ENGINE
@@ -363,14 +364,9 @@ let audioCtx = null;
 const idle = {
   rafId: null,
   startTime: 0,
-  blinkTimer: 0,
-  nextBlinkAt: 0,
-  isBlinking: false,
-  blinkStart: 0,
 
   start() {
     this.startTime = performance.now();
-    this.nextBlinkAt = this.startTime + 2000 + Math.random() * 4000;
     this.tick = this.tick.bind(this);
     this.rafId = requestAnimationFrame(this.tick);
   },
@@ -382,37 +378,14 @@ const idle = {
   tick(now) {
     const elapsed = (now - this.startTime) / 1000;
 
-    // Breathing — subtle scale oscillation (3.5s period)
-    const breathScale = 1 + 0.012 * Math.sin(elapsed * (2 * Math.PI / 3.5));
+    // Organic breathing — gentle vertical float (4s period)
+    const floatY = 2.5 * Math.sin(elapsed * (2 * Math.PI / 4.0));
+    
+    // Head sway — very subtle horizontal drift (6s period)
+    const swayX = 1.2 * Math.sin(elapsed * (2 * Math.PI / 6.0));
 
-    // Head sway — very gentle horizontal drift (5s period)
-    const swayX = 1.8 * Math.sin(elapsed * (2 * Math.PI / 5.0));
-
-    // Slight vertical drift (7s period)
-    const swayY = 0.8 * Math.sin(elapsed * (2 * Math.PI / 7.0));
-
-    avatarStage.style.transform =
-      `scale(${breathScale.toFixed(4)}) translate(${swayX.toFixed(2)}px, ${swayY.toFixed(2)}px)`;
-
-    // Blinking
-    if (!this.isBlinking && now >= this.nextBlinkAt) {
-      this.isBlinking = true;
-      this.blinkStart = now;
-    }
-
-    if (this.isBlinking) {
-      const blinkElapsed = now - this.blinkStart;
-      if (blinkElapsed < 150) {
-        // Close eyes (quick squish)
-        const t = blinkElapsed / 150;
-        const squish = 1 - 0.12 * Math.sin(t * Math.PI);
-        baseHead.style.transform = `scaleY(${squish.toFixed(3)})`;
-      } else {
-        baseHead.style.transform = "scaleY(1)";
-        this.isBlinking = false;
-        this.nextBlinkAt = now + 2000 + Math.random() * 4000;
-      }
-    }
+    // Apply the transform without squishing the pixels via scale
+    avatarStage.style.transform = `translate(${swayX.toFixed(2)}px, ${floatY.toFixed(2)}px)`;
 
     this.rafId = requestAnimationFrame(this.tick);
   }
@@ -621,6 +594,23 @@ async function streamSpeak(text) {
   transcript.classList.add("active");
 
   let streamingText = "";  // accumulates LLM tokens for live display
+  
+  // Play a random filler immediately if available
+  if (fillerData.length > 0) {
+    const randomFiller = fillerData[Math.floor(Math.random() * fillerData.length)];
+    logDebug(`Playing filler: ${randomFiller.text}`);
+    
+    // We queue the filler up instantly!
+    try {
+      const res = await fetch(`${API_BASE}${randomFiller.audioUrl}`);
+      const arrayBuffer = await res.arrayBuffer();
+      const audioBuffer = await ensureAudioContext().decodeAudioData(arrayBuffer);
+      enqueueChunk(audioBuffer, randomFiller.mouthCues || [], 0, randomFiller.text);
+      setState("speaking");
+    } catch(e) {
+      logDebug(`Failed to play filler: ${e}`);
+    }
+  }
 
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(WS_URL);
@@ -791,9 +781,22 @@ function preloadImages() {
   );
 }
 
+async function preloadFillers() {
+  try {
+    const res = await fetch(`${API_BASE}/static/fillers/fillers.json`);
+    if (res.ok) {
+      fillerData = await res.json();
+      logDebug(`Preloaded ${fillerData.length} fillers`);
+    }
+  } catch (err) {
+    logDebug(`No fillers found or error: ${err.message}`);
+  }
+}
+
 async function initializeAvatar() {
   try {
     await preloadImages();
+    await preloadFillers();
     baseHead.src = "./mouths/base-head.png";
     mouthOverlay.src = visemeMap.X;
     currentMouthSource = visemeMap.X;

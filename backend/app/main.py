@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Sunny Local Backend")
 
+# ── Load pre-rendered FAQs ──
+FAQ_CACHE = []
+try:
+    faq_path = BACKEND_DIR / "static" / "faqs" / "faqs.json"
+    if faq_path.exists():
+        FAQ_CACHE = json.loads(faq_path.read_text())
+except Exception as e:
+    logger.error("Failed to load FAQs: %s", e)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -89,6 +98,39 @@ async def avatar_stream(ws: WebSocket):
 
         # Immediately tell the client we're thinking.
         await ws.send_json({"type": "thinking"})
+
+        user_lower = user_text.lower()
+        matched_faq = None
+        for faq in FAQ_CACHE:
+            if any(kw in user_lower for kw in faq["keywords"]):
+                matched_faq = faq
+                break
+                
+        if matched_faq:
+            logger.info("Matched pre-rendered FAQ: %s", matched_faq["text"])
+            
+            # Instantly stream text delta so it types out fast
+            for token in matched_faq["text"].split(" "):
+                await ws.send_json({"type": "text_delta", "token": token + " "})
+                await asyncio.sleep(0.02)
+                
+            # Send the pre-rendered audio payload
+            try:
+                wav_path = BACKEND_DIR / matched_faq["audioUrl"].lstrip("/")
+                audio_b64 = base64.b64encode(wav_path.read_bytes()).decode("ascii")
+                await ws.send_json({
+                    "type": "audio_chunk",
+                    "audio": audio_b64,
+                    "mouthCues": matched_faq["mouthCues"],
+                    "chunkIndex": 0,
+                    "duration": 0.0,
+                    "sentence": matched_faq["text"],
+                })
+            except Exception as e:
+                logger.error("Failed to send pre-rendered FAQ audio: %s", e)
+                
+            await ws.send_json({"type": "done", "fullResponse": matched_faq["text"]})
+            return
 
         # ── Stream LLM response, accumulate into sentences ──
         buffer = ""
